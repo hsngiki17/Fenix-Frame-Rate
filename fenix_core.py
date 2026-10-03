@@ -18,6 +18,7 @@ Sections
     4. Load raw data       image, dark, white cubes; band split, detector ceilings, interior columns
     5. Dark frames         bit-8 fix, per-pixel references, dark statistics; dark cuts
     6. White − dark        per-pixel response to the white panel; white − dark cuts
+    7. Defect map          dark and white − dark flags per core; fixed defects (flagged in all 4 cores)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -192,7 +193,7 @@ def load(verbose=True):
     r = int(HDR[CORE_NAMES[0]]["image"]["vimg2"].strip("{} ").split(",")[0]) - 1     # first SWIR band (0-based)
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
-    dark.cache_clear(); ref.cache_clear()                                            # new data: drop cached results
+    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear()                  # new data: drop cached results
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -322,3 +323,103 @@ def prnu_dev(n, det, k=HP_K):
     dev = 100 * (Pn - median_filter(Pn, size=(k, 1), mode="nearest"))
     dev[sat] = np.nan
     return dev
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 7. Defect map: fixed defects from the dark and white − dark tests
+# - dark_flags(n): pixels {(x, band)} per class from the dark frames. SWIR: all tests; VNIR: saturation only (no gaps,
+#   so no mean or noise cuts; no flashers; dark threshold evidence). Classes (Fischer et al. 2007):
+#     hot / cold    : dark level above / below CUTS["mean"].
+#     noisy / stuck : noise above / below CUTS["noise"] ("too much variation" / "little or no variation").
+#     sat           : at the detector ceiling in any dark frame ("a signal fixed at saturation").
+#     flasher       : a quiet pixel (robust noise ≤ NOISE_CUT) with jumps > K_FRAME × band noise in ≥ 2 frames
+#                     ("intermittently bad across several frames").
+# - white_flags(n): pixels per class from the white − dark response (prnu_dev), at most one class per pixel
+#   (Kieffer 1996):
+#     low  : below the low cut ("very low response or even 'dead' pixels are clearly to be excluded").
+#     over : above the high cut, SWIR only ("exceedingly responsive pixels as suspect").
+#     sat  : at the detector ceiling in any white or dark frame; response not measurable.
+# - defect_map(): fixed defects = flagged in all 4 cores, by either test. Only these are masked (later), so the mask is
+#   the same at every frame rate. Run-specific flags (some cores only) stay in the data, so any frame-rate effect they
+#   carry stays in the noise. Cached; returns read-only views (frozensets, tuples).
+# - defect_mask(det): fixed defects as a boolean array (x, band) over the detector's bands.
+# - Every class is masked, including those that only shift a pixel's offset or gain: such a shift cancels in
+#   reflectance only if the pixel responds linearly, which one white level cannot test (Kieffer 1996: "It is critical to
+#   understand which elements are suspect to avoid misleading results").
+#
+# Result
+# - Dark, fixed: 33 SWIR pixels (hot 24, cold 9, noisy 1, stuck 2, sat 2; a pixel can be in several classes); no VNIR.
+#   Dark, run-specific (kept): 54 SWIR pixels, almost all flashers, 20 / 25 / 18 / 11 per core (26.46 → 52.63 fps),
+#   not in frame-rate order; 41 flagged in one core, 6 in two, 7 in three; plus 1 stuck pixel in Core 60.
+# - White − dark, fixed: 44 pixels (low 14, over 11, sat 19); no run-specific flags.
+# - Defect map: 49 pixels (47 SWIR, 2 VNIR) = white − dark 44 + dark-only 5; 28 flagged by both tests. Most saturated
+#   pixels are also hot in the dark; every weak SWIR pixel is also bad in the dark; over-responsive pixels sit next to
+#   weak ones (e.g. x = 136, band 377; Kieffer 1996: "The most responsive (band-normalized) pixels are adjacent to weak
+#   or non-responsive pixels").
+# - Frame rate: no effect on fixed defects; the map is the same for all 4 cores.
+#
+# Refs
+# - Fischer et al. 2007; Kieffer 1996.
+# ----------------------------------------------------------------------------------------------------------------------
+
+DARK_CLASSES = ("hot", "cold", "noisy", "stuck", "sat", "flasher")
+WHITE_CLASSES = ("low", "over", "sat")
+
+
+def _pixels(mask, sl):
+    """(x, band) pairs of a boolean (interior x, detector band) mask, in full-cube indices."""
+    return {(int(x) + INT.start, int(b) + sl.start) for x, b in np.argwhere(mask)}
+
+
+def dark_flags(n):
+    """Flagged pixels {(x, band)} per dark class for core n, interior columns only."""
+    out = {k: set() for k in DARK_CLASSES}
+    for det, sl in ARRAYS.items():
+        st = {k: v[INT] for k, v in dark_stats(n, det).items()}
+        tests = {"sat": st["sat"]}
+        if det == "SWIR":
+            a = dark(n, det)[INT]
+            d, ms = np.abs(a - np.median(a, 1, keepdims=True)), np.median(a.std(1, ddof=1), 0)
+            quiet = 1.4826 * np.median(d, 1) / ms <= NOISE_CUT
+            tests |= {"hot": st["mean"] > CUTS["mean"][1], "cold": st["mean"] < CUTS["mean"][0],
+                      "noisy": st["noise"] > CUTS["noise"][1], "stuck": st["noise"] < CUTS["noise"][0],
+                      "flasher": quiet & ((d > K_FRAME * ms).sum(1) >= 2)}
+        for k, m in tests.items():
+            out[k] |= _pixels(m, sl)
+    return out
+
+
+def white_flags(n):
+    """Flagged pixels {(x, band)} per white − dark class for core n, interior columns only."""
+    out = {k: set() for k in WHITE_CLASSES}
+    for det, sl in ARRAYS.items():
+        dev = prnu_dev(n, det)[INT]                                       # clipped pixels NaN
+        lo, hi = WCUTS[det]
+        for k, m in (("low", dev <= lo), ("over", dev >= hi), ("sat", np.isnan(dev))):
+            out[k] |= _pixels(m, sl)
+    return out
+
+
+@lru_cache(maxsize=None)
+def defect_map():
+    """Fixed defects (flagged in all 4 cores) and the per-core flags behind them. Cached; read-only contents."""
+    DK = {n: {k: frozenset(v) for k, v in dark_flags(n).items()} for n in CORE_NAMES}
+    WK = {n: {k: frozenset(v) for k, v in white_flags(n).items()} for n in CORE_NAMES}
+    dfix = {k: frozenset.intersection(*(DK[n][k] for n in CORE_NAMES)) for k in DARK_CLASSES}
+    wfix = {k: frozenset.intersection(*(WK[n][k] for n in CORE_NAMES)) for k in WHITE_CLASSES}
+    pixels = tuple(sorted(frozenset().union(*dfix.values(), *wfix.values())))
+    assert all(INT.start <= x < INT.stop for x, _ in pixels), "defect at an edge column"
+    classes = {c: tuple([f"dark:{k}" for k in DARK_CLASSES if c in dfix[k]] +
+                        [f"white:{k}" for k in WHITE_CLASSES if c in wfix[k]]) for c in pixels}
+    return {"pixels": pixels, "classes": classes, "dark_fixed": dfix, "white_fixed": wfix,
+            "dark_flags": DK, "white_flags": WK}
+
+
+def defect_mask(det):
+    """Fixed defects as a boolean array (x, band) over the bands of detector det."""
+    b0, b1, _ = ARRAYS[det].indices(wl.size)
+    m = np.zeros((cores[CORE_NAMES[0]]["dark"].data.shape[0], b1 - b0), bool)
+    for x, b in defect_map()["pixels"]:
+        if b0 <= b < b1:
+            m[x, b - b0] = True
+    return m
