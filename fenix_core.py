@@ -30,6 +30,7 @@ Sections
    11. Scene bit-8 fix    bit-consistent correction of the SWIR scene readings; corrected crop per core (cached)
    12. Reflectance        (scene − dark) ÷ (white − dark) on the crop; fixed defects NaN (cached)
    13. Fill               fixed-defect readings replaced by the MSS-BPR prediction (cached)
+   14. Band trimming      SSDC band SNR; bands kept where SNR ≥ SNR_MIN in every core; trimmed cubes (cached)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -216,6 +217,7 @@ def load(verbose=True):
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
     dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear(); reflectance.cache_clear(); filled.cache_clear()
+    band_snr.cache_clear(); keep_bands.cache_clear(); trimmed.cache_clear()
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -725,3 +727,90 @@ def filled(n):
         out[xi, ti, bi + b0] = predict_at(Y, xi, ti, bi, Q, W)
     assert np.isfinite(out).all(), f"{n}: readings left unfilled"
     return _readonly(out)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 14. Band trimming: remove the bands at each detector's ends where the signal is too weak, from the SNR of the filled
+#     reflectance cubes. The same bands are used for every core and every later task.
+# - Noise per band by SSDC (spectral and spatial de-correlation; Roger & Arnold 1996, as compared by Gao et al. 2013:
+#   "SSDC is the most reliable algorithm for noise estimation of HSIs with different levels of SNR").
+#   - The cube is split into B × B = 6 × 6 blocks: "small block size, say, 6 × 6, can perform as well as more
+#     sophisticated image segmentation" (Gao et al. 2013); blocks without variation (singular regression) are skipped.
+#   - In each block, every reading of band k is predicted from its two neighbouring bands and its neighbouring pixel in
+#     the same line (multiple linear regression); the residual std is the block's noise. Band noise = mean over blocks;
+#     SNR = mean reflectance of the band ÷ band noise.
+#   - Neighbouring bands always come from the same detector; at a detector's end, the two nearest inner bands are used.
+#     The spatial neighbour is in the same line, so Core 30's SWIR line breaks do not affect it.
+# - Assumptions and limits (Gao et al. 2013): noise "random, additive and uncorrelated to the signal component"; signal
+#   variation the regression cannot explain counts as noise ("estimated noise ... is a little greater than true noise
+#   value"), so SNR is slightly underestimated; the mean over blocks is affected by very low signal ("cannot avoid the
+#   influence of very low radiance"), which at the weak blue end could keep a few bands too many.
+# - Threshold SNR_MIN = 10 in every core, i.e. noise at most a tenth of the signal (our choice). Reason (Gao et al.
+#   2013, after Curran & Dungan 1989): "Only when the level of noise is quantitatively lower than the depth of spectral
+#   absorption, the spectral feature can be recognized". 5 and 20 are reported for comparison.
+# - Each detector is trimmed from its ends inward only, so no gaps are created inside a detector.
+# - These SNR values are a tool for the trim, not a result of the noise study.
+# - band_snr(n), keep_bands(), trimmed(n): cached, read-only.
+#
+# Result
+# - Only the first VNIR bands are removed (blue end); every SWIR band passes in every core. SNR ≥ 10: 411 bands kept,
+#   504.75–2502.15 nm (137 VNIR, 274 SWIR); no kept band is below 10 in any core.
+# - Median band SNR: VNIR 78–79, SWIR 244–248 in every core: no frame-rate effect.
+#
+# Refs
+# - Roger & Arnold 1996; Gao et al. 2013, IEEE JSTARS 6(2), 488–498; Curran & Dungan 1989.
+# ----------------------------------------------------------------------------------------------------------------------
+
+SNR_MIN, SSDC_B = 10, 6
+
+
+def ssdc(Y, k, kn, B=SSDC_B):
+    """Noise std and mean of band k of Y (x, line, band) by SSDC in B × B blocks (2 spectral + 1 spatial neighbour)."""
+    nx, nl = (Y.shape[0] - 1) // B * B, Y.shape[1] // B * B
+    blk = lambda A: A.reshape(nx // B, B, nl // B, B).transpose(0, 2, 1, 3).reshape(-1, B * B)
+    y = blk(Y[1:nx + 1, :nl, k])
+    X = np.stack([np.ones_like(y), blk(Y[1:nx + 1, :nl, kn[0]]), blk(Y[1:nx + 1, :nl, kn[1]]),
+                  blk(Y[:nx, :nl, k])], 2)                                       # 2 spectral + 1 spatial neighbour
+    XtX = X.transpose(0, 2, 1) @ X
+    ok = np.linalg.cond(XtX) < 1e10                                             # skip blocks with no variation
+    coef = np.linalg.solve(XtX[ok], X[ok].transpose(0, 2, 1) @ y[ok][..., None])
+    res = y[ok] - (X[ok] @ coef)[..., 0]
+    return np.mean(np.sqrt((res ** 2).sum(1) / (B * B - 4))), y[ok].mean()     # 4 fitted coefficients
+
+
+def _neighbours(k, sl):
+    b0, b1, _ = sl.indices(wl.size)
+    if b0 < k < b1 - 1:
+        return k - 1, k + 1
+    return (k + 1, k + 2) if k == b0 else (k - 2, k - 1)
+
+
+@lru_cache(maxsize=None)
+def band_snr(n):
+    """SSDC SNR per band (all 448 bands) of the filled reflectance cube of core n. Cached, read-only."""
+    Y = filled(n).astype(np.float64)
+    snr = np.empty(wl.size)
+    for sl in ARRAYS.values():
+        for k in range(*sl.indices(wl.size)[:2]):
+            sd, mu = ssdc(Y, k, _neighbours(k, sl))
+            snr[k] = mu / sd
+    return _readonly(snr)
+
+
+@lru_cache(maxsize=None)
+def keep_bands(snr_min=SNR_MIN):
+    """Indices of the bands kept: SNR ≥ snr_min in every core, each detector trimmed from its ends inward."""
+    ok = np.all([band_snr(n) >= snr_min for n in CORE_NAMES], 0)
+    keep = []
+    for det, sl in ARRAYS.items():
+        b0, b1, _ = sl.indices(wl.size)
+        o = ok[b0:b1]
+        assert o.any(), f"no {det} band reaches SNR {snr_min}"
+        keep.append(np.arange(b0 + np.argmax(o), b1 - np.argmax(o[::-1])))
+    return _readonly(np.concatenate(keep))
+
+
+@lru_cache(maxsize=None)
+def trimmed(n):
+    """Filled reflectance cube of core n with the kept bands only (x, line, kept band). Cached, read-only."""
+    return _readonly(filled(n)[:, :, keep_bands()])
