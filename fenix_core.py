@@ -29,6 +29,7 @@ Sections
    10. Neighbour prediction MSS-BPR prediction of each reading from its spatial and spectral neighbours; Q, W
    11. Scene bit-8 fix    bit-consistent correction of the SWIR scene readings; corrected crop per core (cached)
    12. Reflectance        (scene − dark) ÷ (white − dark) on the crop; fixed defects NaN (cached)
+   13. Fill               fixed-defect readings replaced by the MSS-BPR prediction (cached)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -214,7 +215,7 @@ def load(verbose=True):
     r = int(HDR[CORE_NAMES[0]]["image"]["vimg2"].strip("{} ").split(",")[0]) - 1     # first SWIR band (0-based)
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
-    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear(); reflectance.cache_clear()
+    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear(); reflectance.cache_clear(); filled.cache_clear()
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -692,3 +693,35 @@ def reflectance(n):
         if CROP_X.start <= x < CROP_X.stop:
             R[x - CROP_X.start, :, b] = np.nan
     return _readonly(R)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 13. Fill: replace the fixed-defect readings (NaN in the reflectance) so every later step gets a complete cube
+# - Each missing reading (pixel x, band b) is predicted by MSS-BPR (section 10; Fischer et al. 2007, Eqs. 3–5): the
+#   ratio band b / band k in the W columns on each side, times the pixel's own value in band k, median over the Q
+#   nearest bands k on each side. Q, W = MSS_QW; each detector separately; missing neighbours are skipped.
+# - Only the 33 fixed-defect columns inside the crop are filled (≈ 0.03 % of readings), the same in every core.
+# - filled(n): complete reflectance cube (x, line, band), all 448 bands; asserted free of NaN. Cached, read-only.
+#
+# Result
+# - Every defect reading filled (VNIR 960, SWIR 14 880 per core); no NaN left.
+# - Fill check (diagnostics D19, 20 000 held-out measured readings per core): MSS-BPR error (robust std) 1.7–1.8 %
+#   (VNIR) and 0.51–0.52 % (SWIR) of median reflectance, no bias; mean of the two neighbouring bands is close behind
+#   (1.9–2.0 %, 0.55–0.56 %); mean of the two neighbouring columns is clearly worse (4.8–5.0 %, 3.9–4.1 %).
+#
+# Refs
+# - Fischer et al. 2007, Eqs. 3–5.
+# ----------------------------------------------------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def filled(n):
+    """Reflectance (x, line, band) with every NaN reading replaced by its MSS-BPR prediction. Cached, read-only."""
+    R = reflectance(n)
+    out = np.array(R)
+    for det, sl in ARRAYS.items():
+        b0 = sl.indices(wl.size)[0]
+        Y, (Q, W) = R[:, :, sl], MSS_QW[det]
+        xi, ti, bi = np.nonzero(~np.isfinite(Y))
+        out[xi, ti, bi + b0] = predict_at(Y, xi, ti, bi, Q, W)
+    assert np.isfinite(out).all(), f"{n}: readings left unfilled"
+    return _readonly(out)
