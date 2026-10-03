@@ -25,6 +25,7 @@ Sections
     6. White − dark        per-pixel response to the white panel; white − dark cuts
     7. Defect map          dark and white − dark flags per core; fixed defects (flagged in all 4 cores)
     8. Crop                tray interior, the same for all 4 cores
+    9. Views               image composites for display (true colour, any band triple)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -456,3 +457,25 @@ def defect_mask(det):
 LINE_START, LINE_END = 130, 610
 COL_START, COL_END = 30 + 5, 290 - 5
 CROP_X, CROP_L = slice(COL_START, COL_END), slice(LINE_START, LINE_END)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 9. Views: image composites for display only (nothing here enters any computation)
+# - composite(A, wl_arr, nm): bands nearest to the wavelengths nm (one band → greyscale, three → colour), each channel
+#   stretched to its own 2–98 % range; NaN shown white. A: (x, line, band) → image (line, x, len(nm)) in [0, 1].
+# - true_rgb(A, wl_arr): true colour, 680 / 550 / 505 nm (RGB_NM; hylite's RGB preset).
+# ----------------------------------------------------------------------------------------------------------------------
+
+RGB_NM = (680.0, 550.0, 505.0)
+
+
+def composite(A, wl_arr, nm, lo=2, hi=98):
+    """A: (x, line, band) -> (line, x, len(nm)) image in [0, 1]; per-channel 2–98 % stretch; NaN shown white."""
+    c = A[..., [int(np.argmin(np.abs(wl_arr - w))) for w in nm]].astype(np.float32)
+    vmin, vmax = np.nanpercentile(c, [lo, hi], axis=(0, 1))
+    return np.transpose(np.nan_to_num(np.clip((c - vmin) / (vmax - vmin + 1e-9), 0, 1), nan=1.0), (1, 0, 2))
+
+
+def true_rgb(A, wl_arr):
+    """True colour (RGB_NM) of A (x, line, band) -> (line, x, 3) image in [0, 1]."""
+    return composite(A, wl_arr, RGB_NM)
