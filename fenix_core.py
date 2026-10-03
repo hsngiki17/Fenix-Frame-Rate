@@ -28,6 +28,7 @@ Sections
     9. Views               image composites for display (true colour, any band triple)
    10. Neighbour prediction MSS-BPR prediction of each reading from its spatial and spectral neighbours; Q, W
    11. Scene bit-8 fix    bit-consistent correction of the SWIR scene readings; corrected crop per core (cached)
+   12. Reflectance        (scene − dark) ÷ (white − dark) on the crop; fixed defects NaN (cached)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -213,7 +214,7 @@ def load(verbose=True):
     r = int(HDR[CORE_NAMES[0]]["image"]["vimg2"].strip("{} ").split(",")[0]) - 1     # first SWIR band (0-based)
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
-    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear()   # new data: drop caches
+    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear(); reflectance.cache_clear()
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -654,3 +655,40 @@ def scene_fix(n):
     pathlib.Path(OUT).mkdir(parents=True, exist_ok=True)
     np.savez(f, scene=scene, mask=np.packbits(mask), n=mask.size, shape=mask.shape, key=key)
     return _readonly(scene), _readonly(mask)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 12. Reflectance
+# - R = (scene − dark) ÷ (white − dark), assuming the white panel reflects 100 % at every wavelength.
+# - Scene: scene_fix(n) (SWIR bit-8 corrected). References: ref (dark: mean of the bit-8 corrected frames; white: VNIR
+#   mean, SWIR median of the raw frames).
+# - Saturated scene readings, and pixels whose references are clipped or have white − dark ≤ 0, → NaN.
+# - Fixed defects inside the crop → NaN in every line of their column, the same in every core (filled in a later step).
+# - Frame rate and the white reference: the white strip is recorded for the same time in every run, so faster runs get
+#   more white frames (18 → 35) and a less noisy white reference. Its error repeats in every line of a column (a fixed
+#   stripe). This is a real frame-rate effect of the acquisition and is kept.
+# - reflectance(n): float32 (x, line, band) on the crop; cached in memory, read-only.
+#
+# Result
+# - NaN exactly at the 33 fixed defects inside the crop (31 SWIR, 2 VNIR; 0.0295 % of readings), in every line;
+#   nothing else invalid. 15 of these defects also have clipped references (7200 readings per core).
+# - Mean reflectance 0.318–0.321 in every core; 0.11–0.26 % of readings outside 0–1, mostly in the low-signal blue bands.
+# ----------------------------------------------------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def reflectance(n):
+    """Reflectance (x, line, band) on the crop, float32; fixed defects and invalid readings NaN. Cached, read-only."""
+    raw = scene_fix(n)[0].astype(np.float32)
+    R = np.empty_like(raw)
+    for det, sl in ARRAYS.items():
+        d = ref(n, "dark", det)[CROP_X].astype(np.float32)
+        den = ref(n, "white", det)[CROP_X].astype(np.float32) - d
+        clip = ((cores[n]["white"].data[CROP_X, :, sl] >= CEIL[det]).any(1)
+                | (cores[n]["dark"].data[CROP_X, :, sl] >= CEIL[det]).any(1))
+        den[clip | (den <= 0)] = np.nan
+        R[:, :, sl] = (raw[:, :, sl] - d[:, None]) / den[:, None]
+    R[raw >= CEIL_B] = np.nan
+    for x, b in defect_map()["pixels"]:
+        if CROP_X.start <= x < CROP_X.stop:
+            R[x - CROP_X.start, :, b] = np.nan
+    return _readonly(R)
