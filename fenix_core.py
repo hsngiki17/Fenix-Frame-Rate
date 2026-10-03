@@ -19,6 +19,7 @@ Sections
     5. Dark frames         bit-8 fix, per-pixel references, dark statistics; dark cuts
     6. White − dark        per-pixel response to the white panel; white − dark cuts
     7. Defect map          dark and white − dark flags per core; fixed defects (flagged in all 4 cores)
+    8. Crop                tray interior, the same for all 4 cores
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -67,6 +68,13 @@ STYLE = [("#000000", "o", "-"), ("#E69F00", "s", "--"), ("#56B4E9", "^", "-."), 
 
 CEIL = {"VNIR": 4095, "SWIR": 65535}             # detector ceilings: VNIR 12-bit, SWIR 16-bit (hylite fenix.py)
 INT = slice(1, 383)                              # interior columns; edges x = 0, 383 left out of all statistics
+
+# Crop: tray interior (core pieces, wooden dividers, trough bottoms); tray edges and the empty fifth slot removed.
+# - Columns x 35–284: 5 pixels inside the tray walls (x = 30, 290), so no wall pixels are included.
+# - Lines 130–609: leaves out the glare on the top wooden strip.
+# - The same crop for all 4 cores; the cores are offset from each other by at most 2 lines / 2 columns (registration
+#   evidence), within the 5-pixel margin.
+XCROP, LCROP = slice(30 + 5, 290 - 5), slice(130, 610)
 HDR = cores = wl = r = ARRAYS = CEIL_B = None    # set by setup()
 
 
@@ -423,3 +431,21 @@ def defect_mask(det):
         if b0 <= b < b1:
             m[x, b - b0] = True
     return m
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 8. Crop: tray interior (core pieces, wooden dividers, trough bottoms), the same for all 4 cores
+# - Columns x 35–284: 5 pixels inside the tray walls (x = 30, 290), so no wall pixels are included; the empty fifth
+#   slot is removed.
+# - Lines 130–609: leaves out the glare on the top wooden strip.
+# - Chosen by visual inspection of the raw true-colour view (diagnostics D8). The cores are offset from each other by
+#   at most 2 lines / 2 columns (registration, clustering notebook), within the 5-pixel margin.
+# - A fixed defect (x, band) affects every line of its column, so whether it lies inside the crop depends only on x.
+#
+# Result
+# - Each core: (384, 735–739, 448) → (250, 480, 448). 33 of the 49 fixed defects lie inside the crop (31 SWIR, 2 VNIR).
+# ----------------------------------------------------------------------------------------------------------------------
+
+LINE_START, LINE_END = 130, 610
+COL_START, COL_END = 30 + 5, 290 - 5
+CROP_X, CROP_L = slice(COL_START, COL_END), slice(LINE_START, LINE_END)
