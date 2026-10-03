@@ -27,6 +27,7 @@ Sections
     8. Crop                tray interior, the same for all 4 cores
     9. Views               image composites for display (true colour, any band triple)
    10. Neighbour prediction MSS-BPR prediction of each reading from its spatial and spectral neighbours; Q, W
+   11. Scene bit-8 fix    bit-consistent correction of the SWIR scene readings; corrected crop per core (cached)
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -34,6 +35,7 @@ Refs
 """
 
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -211,7 +213,7 @@ def load(verbose=True):
     r = int(HDR[CORE_NAMES[0]]["image"]["vimg2"].strip("{} ").split(",")[0]) - 1     # first SWIR band (0-based)
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
-    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear()                  # new data: drop cached results
+    dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear()   # new data: drop caches
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -579,3 +581,74 @@ def predict_at(Y, xi, ti, bi, Q, W):
             b2br = nanmed0((Yp[X, t, b] / Yp[X, t, b + k]).T)                                     # Eq. 3
         new.append(Yp[xi + W, ti, bi + Q + k] * b2br)                                              # Eq. 4
     return nanmed0(np.stack(new))                                                                  # Eq. 5
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 11. Scene bit-8 correction: SWIR scene readings, from the MSS-BPR prediction (section 10)
+# - Scene lines all differ, so there is no repeated value to compare a reading with (as in the dark frames). Instead each
+#   reading is compared with what its neighbours predict (MSS-BPR, Q, W = MSS_QW["SWIR"]).
+# - Rule (as in bit8_fix for the dark frames): a reading whose residual (reading − prediction, in DN) lies within
+#   B8_WINDOW = 128–384 DN is closer to a 256 DN error than to a normal reading, so it is moved back by 256 DN, but only
+#   in the direction its own bit 8 allows (bit 8 = 1: can only be too high; bit 8 = 0: can only be too low). Readings
+#   further off, and readings without a prediction (NaN neighbours, defects, saturation), are left as they are.
+# - Why correct and not mask: about 10 % of SWIR readings carry the error. Masking them would lose too much data; leaving
+#   them in would make the SWIR noise mostly this error (residual std ≈ 98 DN before vs ≈ 60 DN after correction).
+# - A corrected reading keeps its own value ± 256 DN (and its own noise); the prediction only decides whether to move it.
+# - bit8_scene(A, D, P, bad, det, Q, W, window): corrected DN (float64), correction mask and residual (DN) of raw DN A.
+#   The window is an argument (no global thresholds).
+# - scene_fix(n): the crop (x, line, band) as uint16 with the SWIR bands corrected, and the correction mask
+#   (x, line, SWIR band). Saved to OUT/scene_fix_<core>.npz and reused while its inputs (dark, white − dark, defects,
+#   Q, W, window) are unchanged; cached in memory, read-only.
+#
+# Result (pipeline and diagnostics notebooks)
+# - 9.8–10.0 % of SWIR scene readings corrected in every core; no frame-rate effect.
+# - Realistic injection test (Core 40): 97.9 % of injected errors restored; 0.96 % of clean readings changed by mistake,
+#   rising with signal from 0.1 % (darkest 5 % of readings) to 2.3 % (brightest 5 %).
+#
+# Refs
+# - Fischer et al. 2007 (MSS-BPR); bit-8 evidence (diagnostics D9).
+# ----------------------------------------------------------------------------------------------------------------------
+
+B8_WINDOW = (128, 384)                                          # DN: |residual| range treated as one bit-8 error
+
+
+def bit8_scene(A, D, P, bad, det, Q, W, window=B8_WINDOW):
+    """Bit-consistent bit-8 correction of raw DN A (x, line, band) of one detector. Returns corrected DN, mask, residual."""
+    t, t_max = window
+    Y = calibrated(A, D, P, bad, det)
+    res = (Y - predict_all(Y, Q, W)) * P[:, None]                                    # residual in DN
+    b8 = (A.astype(np.int64) >> 8) & 1
+    down = (b8 == 1) & (res > t) & (res < t_max)
+    up = (b8 == 0) & (res < -t) & (res > -t_max)
+    return A.astype(np.float64) - 256 * down + 256 * up, down | up, res
+
+
+def _fingerprint(*arrs):
+    """Short hash of the inputs, so saved results are reused only if the inputs are unchanged."""
+    h = hashlib.sha1()
+    for a in arrs:
+        h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()
+
+
+@lru_cache(maxsize=None)
+def scene_fix(n):
+    """Crop (x, line, band) as uint16 with SWIR bit-8 corrected, and the correction mask (x, line, SWIR band)."""
+    det = "SWIR"
+    sl, (Q, W) = ARRAYS[det], MSS_QW[det]
+    D, P = flatfield(n, det)
+    bad = defect_mask(det)
+    key = _fingerprint(D[CROP_XW], P[CROP_XW], bad[CROP_XW], np.array([Q, W, *B8_WINDOW]))
+    f = pathlib.Path(OUT, f"scene_fix_{n.replace(' ', '_')}.npz")
+    if f.exists():
+        z = np.load(f)
+        if str(z["key"]) == key:
+            mask = np.unpackbits(z["mask"], count=int(z["n"])).reshape(tuple(z["shape"])).astype(bool)
+            return _readonly(z["scene"]), _readonly(mask)
+    Af, m, _ = bit8_scene(cores[n]["image"].data[CROP_XW, CROP_L, sl], D[CROP_XW], P[CROP_XW], bad[CROP_XW], det, Q, W)
+    scene = np.array(cores[n]["image"].data[CROP_X, CROP_L, :], dtype=np.uint16)
+    scene[:, :, sl] = Af[IN_CROP].astype(np.uint16)
+    mask = m[IN_CROP]
+    pathlib.Path(OUT).mkdir(parents=True, exist_ok=True)
+    np.savez(f, scene=scene, mask=np.packbits(mask), n=mask.size, shape=mask.shape, key=key)
+    return _readonly(scene), _readonly(mask)
