@@ -602,8 +602,10 @@ def predict_at(Y, xi, ti, bi, Q, W):
 #
 # Result (pipeline and diagnostics notebooks)
 # - 9.8–10.0 % of SWIR scene readings corrected in every core; no frame-rate effect.
-# - Realistic injection test (Core 40): 97.9 % of injected errors restored; 0.96 % of clean readings changed by mistake,
-#   rising with signal from 0.1 % (darkest 5 % of readings) to 2.3 % (brightest 5 %).
+# - Injection test (diagnostics D15, first 120 lines): 97.1–97.3 % of injected errors restored; 1.0–1.1 % of other
+#   readings changed (an upper bound). Clean neighbours make this an optimistic case for the mistaken share.
+# - The corrected share rises with signal (≈ 8.5 % → 12.2 %; diagnostics D16), so mistaken corrections are likely more
+#   frequent in bright readings, where the noise is closer to the 128 DN window.
 #
 # Refs
 # - Fischer et al. 2007 (MSS-BPR); bit-8 evidence (diagnostics D9).
