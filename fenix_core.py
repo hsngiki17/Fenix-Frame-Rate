@@ -26,6 +26,7 @@ Sections
     7. Defect map          dark and white − dark flags per core; fixed defects (flagged in all 4 cores)
     8. Crop                tray interior, the same for all 4 cores
     9. Views               image composites for display (true colour, any band triple)
+   10. Neighbour prediction MSS-BPR prediction of each reading from its spatial and spectral neighbours; Q, W
 
 Refs
     hylite: Thiele et al. 2021, Ore Geol. Rev. 136, 104252, doi:10.1016/j.oregeorev.2021.104252.
@@ -39,6 +40,7 @@ import pathlib
 import platform
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 
@@ -479,3 +481,101 @@ def composite(A, wl_arr, nm, lo=2, hi=98):
 def true_rgb(A, wl_arr):
     """True colour (RGB_NM) of A (x, line, band) -> (line, x, 3) image in [0, 1]."""
     return composite(A, wl_arr, RGB_NM)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 10. Neighbour prediction (MSS-BPR; Fischer et al. 2007, Eqs. 3–5)
+# - Idea: neighbouring pixels have spectra of the same shape; only their brightness differs. A reading (x, band b) is
+#   predicted from the pixel's own values in nearby bands:
+#     1. ratio band b / band k in the W columns on each side of x (same line), median over those columns (Eq. 3);
+#     2. that median ratio × the pixel's own value in band k: one estimate (Eq. 4);
+#     3. repeated for the Q nearest bands on each side of b; the prediction is the median of the estimates (Eq. 5).
+# - Applied to fully calibrated data (Fischer: "it is best to use fully calibrated data"): (scene − dark) ÷
+#   band-normalized (white − dark); saturated readings, fixed defects and readings ≤ 0 are NaN, and NaN neighbours are
+#   skipped. Each detector separately: bands are never paired across the two detectors.
+# - flatfield(n, det): dark reference D and band-normalized white − dark P (x, band); clipped or ≤ 0 → NaN.
+# - calibrated(A, D, P, bad, det): fully calibrated float32 copy of raw DN A (x, line, band).
+# - predict_all(Y, Q, W): prediction for every reading of Y; predict_at(Y, xi, ti, bi, Q, W): at selected readings.
+# - CROP_XW: the crop widened by PAD columns on each side, so pixels at the crop edge have neighbours on both sides;
+#   IN_CROP selects the crop inside it. PAD ≥ the largest W used.
+# - pmap(f, items): f over items in parallel threads (NumPy releases the interpreter lock in its heavy loops).
+#
+# Constants (from the Q, W evidence, diagnostics notebook)
+# - MSS_QW: (Q, W) per detector, the pair with the smallest robust spread of prediction errors over the first 5 scene
+#   lines, within Fischer's limits ("W should not be set less than two and Q should not be set less than four"; W > 20
+#   "begins to lose focus on the local statistics"), as Fischer suggests ("a quick statistical test over the first few
+#   frames of data"). VNIR (8, 20), SWIR (8, 10).
+#
+# Refs
+# - Fischer et al. 2007, Eqs. 3–5.
+# ----------------------------------------------------------------------------------------------------------------------
+
+MSS_QW = {"VNIR": (8, 20), "SWIR": (8, 10)}
+PAD = 20
+CROP_XW, IN_CROP = slice(COL_START - PAD, COL_END + PAD), slice(PAD, -PAD)
+
+
+def pmap(f, items):
+    """f over items in parallel threads; results in input order."""
+    with ThreadPoolExecutor(max(1, min(len(items), os.cpu_count() or 1))) as ex:
+        return list(ex.map(f, items))
+
+
+def flatfield(n, det):
+    """Dark reference D (ref) and band-normalized white − dark P (x, band); clipped or non-positive P → NaN."""
+    Pn, sat = wd_mean(n, det)
+    return ref(n, "dark", det), np.where(sat | ~(Pn > 0), np.nan, Pn)
+
+
+def calibrated(A, D, P, bad, det):
+    """Fully calibrated copy (x, line, band) of raw DN A; saturated, defective and ≤ 0 readings → NaN."""
+    Y = A.astype(np.float64)
+    Y[A >= CEIL_B[ARRAYS[det]]] = np.nan
+    Y = (Y - D[:, None]) / P[:, None]
+    Y[np.broadcast_to(bad[:, None], Y.shape) | ~(Y > 0)] = np.nan
+    return Y.astype(np.float32)
+
+
+def shift(Y, k, axis):
+    """Value at index + k along axis; NaN outside the array."""
+    S = np.full_like(Y, np.nan)
+    src, dst = [slice(None)] * Y.ndim, [slice(None)] * Y.ndim
+    src[axis], dst[axis] = (slice(k, None), slice(None, -k)) if k > 0 else (slice(None, k), slice(-k, None))
+    S[tuple(dst)] = Y[tuple(src)]
+    return S
+
+
+def nanmed0(S):
+    """Median along axis 0 ignoring NaN (sorted: NaN last); faster than np.nanmedian."""
+    S, n = np.sort(S, 0), np.isfinite(S).sum(0)
+    m = 0.5 * (np.take_along_axis(S, np.maximum((n - 1) // 2, 0)[None], 0)[0]
+               + np.take_along_axis(S, (n // 2)[None], 0)[0])
+    m[n == 0] = np.nan
+    return m
+
+
+def predict_all(Y, Q, W, block=20):
+    """MSS-BPR prediction (Eqs. 3–5) for every reading of Y (x, line, band), in blocks of lines."""
+    out = np.full_like(Y, np.nan)
+    for s in range(0, Y.shape[1], block):
+        y = Y[:, s:s + block]
+        new = []
+        for k in [*range(-Q, 0), *range(1, Q + 1)]:
+            R = y / shift(y, k, 2)
+            b2br = nanmed0(np.stack([shift(R, d, 0) for d in [*range(-W, 0), *range(1, W + 1)]]))   # Eq. 3
+            new.append(shift(y, k, 2) * b2br)                                                       # Eq. 4
+        out[:, s:s + block] = nanmed0(np.stack(new))                                                # Eq. 5
+    return out
+
+
+def predict_at(Y, xi, ti, bi, Q, W):
+    """MSS-BPR prediction (Eqs. 3–5) at readings (xi, ti, bi) of Y (x, line, band)."""
+    Yp = np.pad(Y, ((W, W), (0, 0), (Q, Q)), constant_values=np.nan)
+    X = xi[:, None] + W + np.r_[-W:0, 1:W + 1][None]
+    t, b = ti[:, None], bi[:, None] + Q
+    new = []
+    for k in [*range(-Q, 0), *range(1, Q + 1)]:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            b2br = nanmed0((Yp[X, t, b] / Yp[X, t, b + k]).T)                                     # Eq. 3
+        new.append(Yp[xi + W, ti, bi + Q + k] * b2br)                                              # Eq. 4
+    return nanmed0(np.stack(new))                                                                  # Eq. 5
