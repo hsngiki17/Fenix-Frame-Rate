@@ -11,6 +11,11 @@ Usage (Kaggle)
     from fenix_core import *      # constants, data and functions into the notebook
     (After any later fx.setup() / fx.load(), run `from fenix_core import *` again.)
 
+Refreshing the code without restarting the kernel
+    !git -C {REPO} pull -q
+    importlib.reload(fx); from fenix_core import *
+    Loaded data are kept; only re-run fx.setup() if sections 1–4 (configuration, headers, loading) changed.
+
 Sections
     1. Configuration       runs, paths, output folder, plot styles
     2. Provenance          package versions, Python, platform, run time, git commit of this file
@@ -58,7 +63,7 @@ CORE_NAMES, FPS = list(RUNS), {n: v[0] for n, v in RUNS.items()}
 PATHS = {n: {k: f"{DATA_ROOT}/{run}/capture/{p}{run}.hdr"
              for k, p in [("image", ""), ("dark", "DARKREF_"), ("white", "WHITEREF_")]}
          for n, (_, run) in RUNS.items()}
-OUT = os.environ.get("FENIX_OUT", "/kaggle/working/out")
+OUT = globals().get("OUT") or os.environ.get("FENIX_OUT", "/kaggle/working/out")
 
 STY = [("-", "o"), ("--", "s"), ("-.", "^"), (":", "D")]
 GRSL = {"font.family": "serif", "font.serif": ["Times New Roman", "Times", "STIXGeneral"], "mathtext.fontset": "stix",
@@ -75,7 +80,9 @@ INT = slice(1, 383)                              # interior columns; edges x = 0
 # - The same crop for all 4 cores; the cores are offset from each other by at most 2 lines / 2 columns (registration
 #   evidence), within the 5-pixel margin.
 XCROP, LCROP = slice(30 + 5, 290 - 5), slice(130, 610)
-HDR = cores = wl = r = ARRAYS = CEIL_B = None    # set by setup()
+# Loaded state, set by setup(). Kept across importlib.reload(fenix_core), so refreshing the code does not reload
+# the data (see refresh() in the notebooks); lru caches are rebuilt on reload.
+HDR, cores, wl, r, ARRAYS, CEIL_B = (globals().get(k) for k in ("HDR", "cores", "wl", "r", "ARRAYS", "CEIL_B"))
 
 
 def setup(out=None, verbose=True):
