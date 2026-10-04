@@ -457,7 +457,7 @@ def defect_mask(det):
 # - Columns x 35–284: 5 pixels inside the tray walls (x = 30, 290), so no wall pixels are included; the empty fifth
 #   slot is removed.
 # - Lines 130–609: leaves out the glare on the top wooden strip.
-# - Chosen by visual inspection of the raw true-colour view (diagnostics D8). The cores are offset from each other by
+# - Chosen by visual inspection of the raw true-colour view (diagnostics: true-colour view). The cores are offset from each other by
 #   at most 2 lines / 2 columns (registration, clustering notebook), within the 5-pixel margin.
 # - A fixed defect (x, band) affects every line of its column, so whether it lies inside the crop depends only on x.
 #
@@ -610,13 +610,13 @@ def predict_at(Y, xi, ti, bi, Q, W):
 #
 # Result (pipeline and diagnostics notebooks)
 # - 9.8–10.0 % of SWIR scene readings corrected in every core; no frame-rate effect.
-# - Injection test (diagnostics D15, first 120 lines): 97.1–97.3 % of injected errors restored; 1.0–1.1 % of other
+# - Injection test (diagnostics: scene bit-8 evidence, first 120 lines): 97.1–97.3 % of injected errors restored; 1.0–1.1 % of other
 #   readings changed (an upper bound). Clean neighbours make this an optimistic case for the mistaken share.
-# - The corrected share rises with signal (≈ 8.5 % → 12.2 %; diagnostics D16), so mistaken corrections are likely more
+# - The corrected share rises with signal (≈ 8.5 % → 12.2 %; diagnostics: corrections vs signal and band), so mistaken corrections are likely more
 #   frequent in bright readings, where the noise is closer to the 128 DN window.
 #
 # Refs
-# - Fischer et al. 2007 (MSS-BPR); bit-8 evidence (diagnostics D9).
+# - Fischer et al. 2007 (MSS-BPR); bit-8 evidence (diagnostics).
 # ----------------------------------------------------------------------------------------------------------------------
 
 B8_WINDOW = (128, 384)                                          # DN: |residual| range treated as one bit-8 error
@@ -717,7 +717,7 @@ def reflectance(n):
 # Result
 # - Every defect reading filled (VNIR 960, SWIR 14 880 per core); no NaN left. fill_mask() marks exactly these
 #   33 (x, band) columns (VNIR 2, SWIR 31); the reflectance is NaN exactly there.
-# - Fill check (diagnostics D19, 20 000 held-out measured readings per core): MSS-BPR error (robust std) 1.7–1.8 %
+# - Fill check (diagnostics: fill check, 20 000 held-out measured readings per core): MSS-BPR error (robust std) 1.7–1.8 %
 #   (VNIR) and 0.51–0.52 % (SWIR) of median reflectance, no bias; mean of the two neighbouring bands is close behind
 #   (1.9–2.0 %, 0.55–0.56 %); mean of the two neighbouring columns is clearly worse (4.8–5.0 %, 3.9–4.1 %).
 #
