@@ -217,7 +217,7 @@ def load(verbose=True):
     ARRAYS = {"VNIR": slice(0, r), "SWIR": slice(r, None)}
     CEIL_B = np.where(np.arange(wl.size) < r, CEIL["VNIR"], CEIL["SWIR"])
     dark.cache_clear(); ref.cache_clear(); defect_map.cache_clear(); scene_fix.cache_clear(); reflectance.cache_clear(); filled.cache_clear()
-    band_snr.cache_clear(); keep_bands.cache_clear(); trimmed.cache_clear()
+    band_snr.cache_clear(); keep_bands.cache_clear(); trimmed.cache_clear(); fill_mask.cache_clear()
 
     if verbose:
         print(f"{'core':8} {'fps':>6} | {'lines':>5} {'dark':>4} {'white':>5} | max DN VNIR, SWIR (image)")
@@ -316,9 +316,12 @@ def dark_stats(n, det):
 #   represents the raw responsivity of the detector".
 # - prnu_dev(n, det): % deviation of each pixel from the median of its HP_K neighbouring columns (itself and 2 on each
 #   side) in the same band; clipped pixels NaN. Removes the uneven lighting of the white panel across the track, so
-#   only the pixels themselves are tested. EMVA 1288 §8.1 applies a highpass filter "to show the properties of the
-#   camera rather than the properties of an imperfect illumination system"; EMVA uses box filters, the column median
-#   is our adaptation.
+#   only the pixels themselves are tested. This follows the idea of EMVA 1288 R4.0 §8.1, where a highpass filter is
+#   applied "In order to show the properties of the camera rather than the properties of an imperfect illumination
+#   system". Ours does not follow EMVA's filter: EMVA smooths in 2-D with "A 7 × 7 box filter, an 11 × 11 box filter,
+#   and a 3 × 3 binomial filter"; ours is a 5-column median along x within each band. On our detector one axis is
+#   spectral, where the white − dark level changes steeply with wavelength (lamp spectrum, detector response); that is
+#   real signal, not illumination error, so we do not smooth across bands.
 #
 # Constants (from the white − dark threshold evidence, diagnostics notebook)
 # - WCUTS: % deviation (low, high), each inside a gap found in all 4 cores. SWIR −25 / +7 %; VNIR −20 % (no gap common
@@ -510,7 +513,8 @@ def true_rgb(A, wl_arr):
 # - MSS_QW: (Q, W) per detector, the pair with the smallest robust spread of prediction errors over the first 5 scene
 #   lines, within Fischer's limits ("W should not be set less than two and Q should not be set less than four"; W > 20
 #   "begins to lose focus on the local statistics"), as Fischer suggests ("a quick statistical test over the first few
-#   frames of data"). VNIR (8, 20), SWIR (8, 10).
+#   frames of data"). VNIR (8, 20), SWIR (8, 10). Larger Q and W predict better and the gain levels off, so the choice
+#   is not critical (with 10 lines SWIR gives (6, 10), almost as good).
 #
 # Refs
 # - Fischer et al. 2007, Eqs. 3–5.
@@ -704,9 +708,15 @@ def reflectance(n):
 #   nearest bands k on each side. Q, W = MSS_QW; each detector separately; missing neighbours are skipped.
 # - Only the 33 fixed-defect columns inside the crop are filled (≈ 0.03 % of readings), the same in every core.
 # - filled(n): complete reflectance cube (x, line, band), all 448 bands; asserted free of NaN. Cached, read-only.
+# - fill_mask(): which readings were filled, (x, band) on the crop, the same in every line and every core (a detector
+#   defect affects every line). Processing runs on the full filled cube; statistics and metrics (noise estimates, stripe
+#   measures, denoising scores) exclude these readings, because filled values are predictions, smoother than measured
+#   ones. Kieffer 1996: "It is assumed here that any data distribution will be accompanied by information unambiguously
+#   indicating which data have been replaced!"
 #
 # Result
-# - Every defect reading filled (VNIR 960, SWIR 14 880 per core); no NaN left.
+# - Every defect reading filled (VNIR 960, SWIR 14 880 per core); no NaN left. fill_mask() marks exactly these
+#   33 (x, band) columns (VNIR 2, SWIR 31); the reflectance is NaN exactly there.
 # - Fill check (diagnostics D19, 20 000 held-out measured readings per core): MSS-BPR error (robust std) 1.7–1.8 %
 #   (VNIR) and 0.51–0.52 % (SWIR) of median reflectance, no bias; mean of the two neighbouring bands is close behind
 #   (1.9–2.0 %, 0.55–0.56 %); mean of the two neighbouring columns is clearly worse (4.8–5.0 %, 3.9–4.1 %).
@@ -727,6 +737,16 @@ def filled(n):
         out[xi, ti, bi + b0] = predict_at(Y, xi, ti, bi, Q, W)
     assert np.isfinite(out).all(), f"{n}: readings left unfilled"
     return _readonly(out)
+
+
+@lru_cache(maxsize=None)
+def fill_mask():
+    """Filled readings, (x, band) on the crop: True = filled (predicted), the same in every line and core. Read-only."""
+    m = np.zeros((CROP_X.stop - CROP_X.start, wl.size), bool)
+    for x, b in defect_map()["pixels"]:
+        if CROP_X.start <= x < CROP_X.stop:
+            m[x - CROP_X.start, b] = True
+    return _readonly(m)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -750,7 +770,7 @@ def filled(n):
 #   absorption, the spectral feature can be recognized". 5 and 20 are reported for comparison.
 # - Each detector is trimmed from its ends inward only, so no gaps are created inside a detector.
 # - These SNR values are a tool for the trim, not a result of the noise study.
-# - band_snr(n), keep_bands(), trimmed(n): cached, read-only.
+# - band_snr(n), keep_bands(), trimmed(n): cached, read-only. fill_mask_trimmed(): fill_mask() on the kept bands.
 #
 # Result
 # - Only the first VNIR bands are removed (blue end); every SWIR band passes in every core. SNR ≥ 10: 411 bands kept,
@@ -808,6 +828,11 @@ def keep_bands(snr_min=SNR_MIN):
         assert o.any(), f"no {det} band reaches SNR {snr_min}"
         keep.append(np.arange(b0 + np.argmax(o), b1 - np.argmax(o[::-1])))
     return _readonly(np.concatenate(keep))
+
+
+def fill_mask_trimmed():
+    """fill_mask() on the kept bands, (x, kept band)."""
+    return fill_mask()[:, keep_bands()]
 
 
 @lru_cache(maxsize=None)
